@@ -1,0 +1,9 @@
+.vs/
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.suo
+*.aps
+*.ncb
+*.sdf
+*.opensdf

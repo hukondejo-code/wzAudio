@@ -1,0 +1,12 @@
+<Solution>
+  <Configurations>
+    <BuildType Name="Debug" />
+    <BuildType Name="Release" />
+    <BuildType Name="wzAudio2" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="wzAudio.vcxproj" Id="3cf91b49-b006-45fa-b0bd-678839c1e098">
+    <BuildType Solution="wzAudio2|x86" Project="Release" />
+  </Project>
+</Solution>

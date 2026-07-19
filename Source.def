@@ -1,0 +1,12 @@
+LIBRARY "wzAudio"
+EXPORTS
+    wzAudioCreate
+    wzAudioGetStreamOffsetRange
+    wzAudioPlay
+    wzAudioStop
+    wzAudioSetVolume
+    wzAudioOption
+    wzAudioDestroy
+    
+    
+   
