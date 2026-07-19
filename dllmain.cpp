@@ -64,8 +64,27 @@ public:
 
     void __thiscall Play(const char* filePath, int volume, int unknown) override {
         if (!filePath) return;
+
+        // Ellenőrizzük, hogy a zene egyáltalán be van-e kapcsolva a Registry-ben
+        HKEY hKey;
+        DWORD musicOn = 1;
+        DWORD dataSize = sizeof(musicOn);
+        if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Webzen\\Mu\\Config", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            if (RegQueryValueExA(hKey, "MusicOn", NULL, NULL, (LPBYTE)&musicOn, &dataSize) != ERROR_SUCCESS) {
+                RegQueryValueExA(hKey, "MusicOnOff", NULL, NULL, (LPBYTE)&musicOn, &dataSize);
+            }
+            RegCloseKey(hKey);
+        }
+
+        // Ha a Registry szerint le van némítva (0), akkor leállítjuk a jelenlegi zenét és kilépünk
+        if (musicOn == 0) {
+            mciSendStringA("close my_mp3", NULL, 0, NULL);
+            g_CurrentTrack = "";
+            return;
+        }
+
         if (g_CurrentTrack == filePath) {
-            ApplyMCIVolume(); // Ha ugyanaz a szám megy, de frissíteni kell a hangerőt
+            ApplyMCIVolume();
             return;
         }
 
@@ -76,9 +95,10 @@ public:
         if (mciSendStringA(openCmd.c_str(), NULL, 0, NULL) == 0)
         {
             mciSendStringA("play my_mp3 repeat", NULL, 0, NULL);
-            ApplyMCIVolume(); // Lejátszás indításakor azonnal beállítjuk a beolvasott hangerőt
+            ApplyMCIVolume();
         }
     }
+
 
     void __thiscall Stop() override {
         mciSendStringA("close my_mp3", NULL, 0, NULL);
