@@ -1,12 +1,19 @@
 LIBRARY "wzAudio"
 EXPORTS
-    wzAudioCreate
-    wzAudioGetStreamOffsetRange
-    wzAudioPlay
-    wzAudioStop
-    wzAudioSetVolume
-    wzAudioOption
-    wzAudioDestroy
-    
-    
-   
+    wzAudioCreate                  @1
+    wzAudioDestroy                 @2
+    wzAudioGetStreamInfo           @3
+    wzAudioGetStreamOffsetRange    @4
+    wzAudioGetStreamOffsetSec      @5
+    wzAudioGetVolume               @6
+    wzAudioOpenFile                @7
+    wzAudioOption                  @8
+    wzAudioPause                   @9
+    wzAudioPlay                    @10
+    wzAudioSeek                    @11
+    wzAudioSetEqualizer            @12
+    wzAudioSetMixerMode            @13
+    wzAudioSetVolume               @14
+    wzAudioStop                    @15
+    wzAudioVolumeDown              @16
+    wzAudioVolumeUp                @17

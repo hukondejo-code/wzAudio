@@ -10,33 +10,24 @@ std::string g_CurrentTrack = "";
 // REGISTRY OLVASÓ: Lekéri a Launcher által mentett egyedi zenei hangerőt
 int GetMusicVolumeFromRegistry() {
     HKEY hKey;
-    DWORD volumeValue = 5; // Alapértelmezett érték (közepes hangerő), ha nincs mentés
-    DWORD dataSize = sizeof(volumeValue);
+    DWORD musicVolume = 5; // Fallback: közepes hangerő (5-ös szint), ha még nem futott a Launcher
+    DWORD dataSize = sizeof(musicVolume);
 
-    // Megnyitjuk a képen látható pontos Registry útvonalat
+    // Megnyitjuk a Registry-t
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Webzen\\Mu\\Config", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        // Kiolvassuk a közös VolumeLevel kulcsot
-        RegQueryValueExA(hKey, "VolumeLevel", NULL, NULL, (LPBYTE)&volumeValue, &dataSize);
+        // Kiolvassuk a Launcher egyedi zenei hangerő kulcsát
+        RegQueryValueExA(hKey, "VolumeLevel", NULL, NULL, (LPBYTE)&musicVolume, &dataSize);
         RegCloseKey(hKey);
     }
 
-    // Mivel a játék skálája 0-4 vagy 0-9 között mozog (a képen a 4-es érték van maxon vagy középen),
-    // biztonsági játékot játszunk: ha 4 a max, akkor 250-nel szorozzuk, ha 9 a max, akkor 111-gyel.
-    // Teszteljük le úgy, hogy a kapott értéket felskálázzuk az MCI 0-1000 skálájára.
-
-    int mciVolume = 0;
-    if (volumeValue <= 4) {
-        mciVolume = volumeValue * 250; // Ha 4-es skálát használ a kliens (4 * 250 = 1000)
-    }
-    else {
-        mciVolume = volumeValue * 111; // Ha 9-es skálát használ a kliens (9 * 111 = 999)
-    }
-
+    // A launcher 0-9 közötti értéket ad le. Felskálázzuk az MCI 0-1000 skálájára.
+    int mciVolume = musicVolume * 111;
     if (mciVolume > 1000) mciVolume = 1000;
     if (mciVolume < 0) mciVolume = 0;
 
     return mciVolume;
 }
+
 
 // Alkalmazza a kiszámolt hangerőt a futó MP3-ra
 void ApplyMCIVolume() {
@@ -67,17 +58,17 @@ public:
 
         // Ellenőrizzük, hogy a zene egyáltalán be van-e kapcsolva a Registry-ben
         HKEY hKey;
-        DWORD musicOn = 1;
-        DWORD dataSize = sizeof(musicOn);
+        DWORD musicOnOff = 1;
+        DWORD dataSize = sizeof(musicOnOff);
         if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Webzen\\Mu\\Config", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-            if (RegQueryValueExA(hKey, "MusicOn", NULL, NULL, (LPBYTE)&musicOn, &dataSize) != ERROR_SUCCESS) {
-                RegQueryValueExA(hKey, "MusicOnOff", NULL, NULL, (LPBYTE)&musicOn, &dataSize);
+            if (RegQueryValueExA(hKey, "MusicOn", NULL, NULL, (LPBYTE)&musicOnOff, &dataSize) != ERROR_SUCCESS) {
+                RegQueryValueExA(hKey, "MusicOnOff", NULL, NULL, (LPBYTE)&musicOnOff, &dataSize);
             }
             RegCloseKey(hKey);
         }
 
         // Ha a Registry szerint le van némítva (0), akkor leállítjuk a jelenlegi zenét és kilépünk
-        if (musicOn == 0) {
+        if (musicOnOff == 0) {
             mciSendStringA("close my_mp3", NULL, 0, NULL);
             g_CurrentTrack = "";
             return;
@@ -116,7 +107,7 @@ CWzAudioImpl g_AudioInstance;
 // EXPORTÁLT FÜGGVÉNYEK
 extern "C" __declspec(dllexport) void* __cdecl wzAudioCreate() {
     mciSendStringA("close all", NULL, 0, NULL);
-    return &g_AudioInstance;
+    return &g_AudioInstance; // Visszaadjuk az objektum mutatóját, ez kötelező a kliensnek!
 }
 
 extern "C" __declspec(dllexport) int __cdecl wzAudioPlay(const char* filePath, int volume, int unknown) {
@@ -129,11 +120,69 @@ extern "C" __declspec(dllexport) int __cdecl wzAudioStop() {
     return 1;
 }
 
+// Az inicializációs ellenőrzések fix SIKERES (1) visszatérést kapnak!
 extern "C" __declspec(dllexport) int __cdecl wzAudioDestroy() { return 1; }
 extern "C" __declspec(dllexport) int __cdecl wzAudioOption(int option, int value) { return 1; }
-extern "C" __declspec(dllexport) int __cdecl wzAudioSetVolume(int volume) { return 1; }
+extern "C" __declspec(dllexport) int __cdecl wzAudioSetVolume(int volume) {
+    g_AudioInstance.SetVolume(volume); // Itt is kényszerítjük a saját hangerőnket!
+    return 1;
+}
 extern "C" __declspec(dllexport) int __cdecl wzAudioGetStreamOffsetRange(int unk1, int unk2) { return 1; }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
-    return TRUE;
+// =========================================================================
+// AZ ÚJONNAN FELFEDEZETT HIÁNYZÓ EXPORTÁLT FÜGGVÉNYEK STUBJAI
+// =========================================================================
+
+// Visszaadja a hangfolyam információit (0 = sikeres/nincs hiba)
+extern "C" __declspec(dllexport) int __cdecl wzAudioGetStreamInfo(int unk1, int unk2) {
+    return 0;
 }
+
+// Visszaadja a folyam eltolódását másodpercben
+extern "C" __declspec(dllexport) int __cdecl wzAudioGetStreamOffsetSec(int unk1) {
+    return 0;
+}
+
+// Lekéri az aktuális hangerőt (visszaadjuk a registry-ből olvasott értéket, vagy fix 5-öt)
+extern "C" __declspec(dllexport) int __cdecl wzAudioGetVolume() {
+    return GetMusicVolumeFromRegistry();
+}
+
+// Fájlmegnyitási stub, az MCI open intézi helyette, így itt csak sikert (1) adunk vissza
+extern "C" __declspec(dllexport) int __cdecl wzAudioOpenFile(const char* filePath) {
+    return 1;
+}
+
+// Zene szüneteltetése (opcionális, ha a kliens hívná, mci paranccsal leállítható)
+extern "C" __declspec(dllexport) int __cdecl wzAudioPause() {
+    mciSendStringA("pause my_mp3", NULL, 0, NULL);
+    return 1;
+}
+
+// Pozicionálás a zenében
+extern "C" __declspec(dllexport) int __cdecl wzAudioSeek(int position) {
+    return 1;
+}
+
+// Hangszínszabályzó (Equalizer) beállítása (0 = kikapcsolva/alapértelmezett)
+extern "C" __declspec(dllexport) int __cdecl wzAudioSetEqualizer(int eqMode) {
+    return 0;
+}
+
+// !!! A LEGGYANÚSABB BŰNÖS !!! Keverő mód beállítása.
+// Ha ezt nem találja vagy hibát ad, azt hiszi, nincs hardver. Fix 1-et (sikeres) adunk vissza!
+extern "C" __declspec(dllexport) int __cdecl wzAudioSetMixerMode(int mode) {
+    return 1;
+}
+
+// Hangerő csökkentése billentyűkombinációra
+extern "C" __declspec(dllexport) int __cdecl wzAudioVolumeDown() {
+    return 1;
+}
+
+// Hangerő növelése billentyűkombinációra
+extern "C" __declspec(dllexport) int __cdecl wzAudioVolumeUp() {
+    return 1;
+}
+
+
