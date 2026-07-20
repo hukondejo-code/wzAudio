@@ -28,7 +28,6 @@ int GetMusicVolumeFromRegistry() {
     return mciVolume;
 }
 
-
 // Alkalmazza a kiszámolt hangerőt a futó MP3-ra
 void ApplyMCIVolume() {
     if (g_CurrentTrack == "") return;
@@ -49,9 +48,18 @@ public:
     virtual void __thiscall Destroy() = 0;
 };
 
+#ifndef DS_OK
+#define DS_OK 0
+#endif
+
 class CWzAudioImpl : public IWzAudio {
 public:
-    int __thiscall GetStreamOffsetRange(int unk1, int unk2) override { return 1; }
+    // Az IGCN kliens a DirectSound init ellenőrzésekor ezt a függvényt hívja meg, 
+    // hogy lekérdezze a hangfolyam puffereit. Ha ide DS_OK (0) értéket adunk vissza,
+    // a kliens azt hiszi, hogy a DirectSound sikeresen elindult!
+    int __thiscall GetStreamOffsetRange(int unk1, int unk2) override {
+        return DS_OK; // A vak 1-es helyett fixen DS_OK (0)-t adunk vissza!
+    }
 
     void __thiscall Play(const char* filePath, int volume, int unknown) override {
         if (!filePath) return;
@@ -90,15 +98,15 @@ public:
         }
     }
 
+    void __thiscall Stop() override { mciSendStringA("close my_mp3", NULL, 0, NULL); g_CurrentTrack = ""; }
+    void __thiscall SetVolume(int volume) override { ApplyMCIVolume(); }
 
-    void __thiscall Stop() override {
-        mciSendStringA("close my_mp3", NULL, 0, NULL);
-        g_CurrentTrack = "";
+    // Ha a kliens az Option-ön keresztül próbálná konfigurálni a DirectSound-ot,
+    // biztosítjuk, hogy ne kapjon hibaüzenetet a stacket illetően.
+    void __thiscall Option(int option, int value) override {
+        // Üresen hagyjuk, nem engedjük, hogy a gyári hibás DirectSound kód felülírja az MCI-t
     }
 
-    // Ha a kliens belsőleg bántaná a hangerőt, mi felülbíráljuk a sajátunkkal
-    void __thiscall SetVolume(int volume) override { ApplyMCIVolume(); }
-    void __thiscall Option(int option, int value) override {}
     void __thiscall Destroy() override {}
 };
 
