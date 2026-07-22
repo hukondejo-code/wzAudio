@@ -10,7 +10,7 @@ std::string g_CurrentTrack = "";
 // REGISTRY OLVASÓ: Lekéri a Launcher által mentett egyedi zenei hangerőt
 int GetMusicVolumeFromRegistry() {
     HKEY hKey;
-    DWORD musicVolume = 5; // Fallback: közepes hangerő (5-ös szint), ha még nem futott a Launcher
+	DWORD musicVolume = 9; // changed from 5 (mid) to MuOnline standard 9 (high)
     DWORD dataSize = sizeof(musicVolume);
 
     // Megnyitjuk a Registry-t
