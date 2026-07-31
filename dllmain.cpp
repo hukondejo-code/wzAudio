@@ -4,8 +4,6 @@
 #include <string>
 #include <filesystem>
 #include <random>
-#include <thread>
-#include <atomic>
 #include <windows.h>
 #include <mmsystem.h>
 
@@ -14,12 +12,18 @@
 namespace fs = std::filesystem;
 
 // GLOBÁLIS VÁLTOZÓK
-std::string g_CurrentTrack = "";       // A konkrét fájl, ami épp szól (pl. "Data\\Music\\Lorencia\\01.mp3")
-std::string g_RequestedTrack = "";     // Az eredeti név, amit a kliens kért (pl. "Data\\Music\\Lorencia.mp3")
-std::atomic<bool> g_ThreadRunning = false;
-std::thread g_MusicMonitorThread;
+std::string g_CurrentTrack = "";
+std::string g_RequestedTrack = "";
+HWND g_HwndMCI = NULL; // A rejtett ablakunk fogantyúja az MCI üzenetekhez
 
-// REGISTRY OLVASÓ: Lekéri a Launcher által mentett egyedi zenei hangerőt
+// FÜGGVÉNY DEKLARÁCIÓK
+int GetMusicVolumeFromRegistry();
+void ApplyMCIVolume();
+std::string GetRandomMp3FromFolderIfNeeded(const std::string& originalPath, const std::string& lastPlayedTrack);
+void PlayNextRotatedTrack();
+LRESULT CALLBACK MCIWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+
+// REGISTRY OLVASÓ
 int GetMusicVolumeFromRegistry() {
     HKEY hKey;
     DWORD musicVolume = 9; // MuOnline standard 9 (high)
@@ -37,16 +41,15 @@ int GetMusicVolumeFromRegistry() {
     return mciVolume;
 }
 
-// Alkalmazza a kiszámolt hangerőt a futó MP3-ra
+// Hangerő alkalmazása
 void ApplyMCIVolume() {
     if (g_CurrentTrack == "") return;
-
     int volume = GetMusicVolumeFromRegistry();
     std::string volCmd = "setaudio my_mp3 volume to " + std::to_string(volume);
     mciSendStringA(volCmd.c_str(), NULL, 0, NULL);
 }
 
-// INTELLIGENS VÉLETLENSZERŰSÍTŐ: Kezeli a mappákat és kiszűri a duplikációt
+// Random választó modul
 std::string GetRandomMp3FromFolderIfNeeded(const std::string& originalPath, const std::string& lastPlayedTrack = "") {
     std::string folder_name = originalPath;
     size_t last_dot = folder_name.find_last_of(".");
@@ -86,34 +89,49 @@ std::string GetRandomMp3FromFolderIfNeeded(const std::string& originalPath, cons
     return originalPath;
 }
 
-// HÁTTÉRSZÁL ROUTINE: Figyeli a szám végét és duplikáció-mentesen újat indít
-void MusicMonitorRoutine() {
-    char statusMode[32];
+// Ezt hívjuk meg, ha új számot kell indítani a rotációban
+void PlayNextRotatedTrack() {
+    mciSendStringA("close my_mp3", NULL, 0, NULL);
 
-    while (g_ThreadRunning) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500)); // fél másodpercenként ellenőriz
+    // Kérünk egy új számot, kizárva az előzőt
+    g_CurrentTrack = GetRandomMp3FromFolderIfNeeded(g_RequestedTrack, g_CurrentTrack);
 
-        if (g_CurrentTrack.empty()) continue;
-
-        // Lekérjük az MCI aktuális állapotát
-        ZeroMemory(statusMode, sizeof(statusMode));
-        mciSendStringA("status my_mp3 mode", statusMode, sizeof(statusMode) - 1, NULL);
-
-        // Ha a státusz "stopped", vagyis organikusan véget ért a zeneszám
-        if (strcmp(statusMode, "stopped") == 0) {
-            mciSendStringA("close my_mp3", NULL, 0, NULL);
-
-            // Kérünk egy ÚJ random számot, átadva a g_CurrentTrack-et, hogy azt SKIP-elje
-            std::string nextTrack = GetRandomMp3FromFolderIfNeeded(g_RequestedTrack, g_CurrentTrack);
-            g_CurrentTrack = nextTrack;
-
-            std::string openCmd = "open \"" + g_CurrentTrack + "\" type mpegvideo alias my_mp3";
-            if (mciSendStringA(openCmd.c_str(), NULL, 0, NULL) == 0) {
-                mciSendStringA("play my_mp3", NULL, 0, NULL); // Nincs repeat kapcsoló, a szál léptet
-                ApplyMCIVolume();
-            }
-        }
+    std::string openCmd = "open \"" + g_CurrentTrack + "\" type mpegvideo alias my_mp3";
+    if (mciSendStringA(openCmd.c_str(), NULL, 0, NULL) == 0) {
+        // FONTOS: A "notify" kapcsoló parancsolja meg a Windowsnak, hogy szóljon az ablakunknak, ha VÉGE a számnak!
+        std::string playCmd = "play my_mp3 notify";
+        mciSendStringA(playCmd.c_str(), NULL, 0, (HWND)g_HwndMCI);
+        ApplyMCIVolume();
     }
+}
+
+// A REJTETT ABLAK ÜZENETKEZELŐJE
+LRESULT CALLBACK MCIWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    // Amikor az MCI lejátszott egy dalt a 'notify' kapcsoló miatt, ezt az üzenetet küldi:
+    if (uMsg == MM_MCINOTIFY) {
+        if (wParam == MCI_NOTIFY_SUCCESSFUL) {
+            // A szám sikeresen lefutott a végéig -> Indítjuk a következőt!
+            PlayNextRotatedTrack();
+        }
+        return 0;
+    }
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
+// Rejtett ablak létrehozása háttérszál helyett
+void CreateMCIHelperWindow() {
+    if (g_HwndMCI != NULL) return;
+
+    WNDCLASSEXA wc = { 0 };
+    wc.cbSize = sizeof(WNDCLASSEXA);
+    wc.lpfnWndProc = MCIWindowProc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = "MuWzAudioMCIHelper";
+
+    RegisterClassExA(&wc);
+
+    // Létrehozunk egy láthatatlan ablakot, ami csak az üzeneteket fogadja
+    g_HwndMCI = CreateWindowExA(0, wc.lpszClassName, "MCI Helper", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, wc.hInstance, NULL);
 }
 
 // SZIGORÚ WEBZEN VTABLE SORREND
@@ -133,14 +151,12 @@ public:
 
 class CWzAudioImpl : public IWzAudio {
 public:
-    int __thiscall GetStreamOffsetRange(int unk1, int unk2) override {
-        return DS_OK;
-    }
+    int __thiscall GetStreamOffsetRange(int unk1, int unk2) override { return DS_OK; }
 
     void __thiscall Play(const char* filePath, int volume, int unknown) override {
         if (!filePath) return;
 
-        // Ellenőrizzük, hogy a zene egyáltalán be van-e kapcsolva a Registry-ben
+        // Registry ellenőrzés
         HKEY hKey;
         DWORD musicOnOff = 1;
         DWORD dataSize = sizeof(musicOnOff);
@@ -156,23 +172,17 @@ public:
             return;
         }
 
-        // Ha a kliens ugyanazt a zónát (placeholder fájlt) kéri, ami már fut, nem szakítjuk meg
+        // Ha a kliens ugyanazt a zónát kéri, nem bántjuk a lejátszást
         if (g_RequestedTrack == filePath) {
             ApplyMCIVolume();
             return;
         }
 
-        // Új zónára váltás (teleportálás) esetén takarítunk
-        mciSendStringA("close my_mp3", NULL, 0, NULL);
-
         g_RequestedTrack = filePath;
-        g_CurrentTrack = GetRandomMp3FromFolderIfNeeded(g_RequestedTrack, ""); // Első lejátszáskor bármi jöhet
+        g_CurrentTrack = ""; // Reseteljük az előző dalt az új zónánál
 
-        std::string openCmd = "open \"" + g_CurrentTrack + "\" type mpegvideo alias my_mp3";
-        if (mciSendStringA(openCmd.c_str(), NULL, 0, NULL) == 0) {
-            mciSendStringA("play my_mp3", NULL, 0, NULL);
-            ApplyMCIVolume();
-        }
+        // Elindítjuk az első számot az új zónában
+        PlayNextRotatedTrack();
     }
 
     void __thiscall Stop() override {
@@ -192,11 +202,8 @@ CWzAudioImpl g_AudioInstance;
 extern "C" __declspec(dllexport) void* __cdecl wzAudioCreate() {
     mciSendStringA("close all", NULL, 0, NULL);
 
-    // Biztonságos háttérszál indítás inicializáláskor
-    if (!g_ThreadRunning) {
-        g_ThreadRunning = true;
-        g_MusicMonitorThread = std::thread(MusicMonitorRoutine);
-    }
+    // Inicializáláskor létrehozzuk a rejtett ablakot
+    CreateMCIHelperWindow();
 
     return &g_AudioInstance;
 }
@@ -212,12 +219,9 @@ extern "C" __declspec(dllexport) int __cdecl wzAudioStop() {
 }
 
 extern "C" __declspec(dllexport) int __cdecl wzAudioDestroy() {
-    // Háttérszál leállítása a DLL megsemmisülésekor
-    if (g_ThreadRunning) {
-        g_ThreadRunning = false;
-        if (g_MusicMonitorThread.joinable()) {
-            g_MusicMonitorThread.join();
-        }
+    if (g_HwndMCI) {
+        DestroyWindow(g_HwndMCI);
+        g_HwndMCI = NULL;
     }
     return 1;
 }
@@ -228,7 +232,6 @@ extern "C" __declspec(dllexport) int __cdecl wzAudioSetVolume(int volume) {
     return 1;
 }
 extern "C" __declspec(dllexport) int __cdecl wzAudioGetStreamOffsetRange(int unk1, int unk2) { return 1; }
-
 
 // =========================================================================
 // AZ ÚJONNAN FELFEDEZETT HIÁNYZÓ EXPORTÁLT FÜGGVÉNYEK STUBJAI
