@@ -14,13 +14,7 @@
 
 namespace fs = std::filesystem;
 
-// Globális struktúra egy aktív 3D hang követéséhez
-struct Active3DSound {
-    IXAudio2SourceVoice* pSourceVoice;
-    int targetMobIndex; // Melyik szörnyhöz tartozik a hang
-};
 
-std::vector<Active3DSound> g_Active3DSounds;
 
 // ---------------------------------------------------------------------------
 //  LOGOLÁS (DEBUG) SEGÉDFÜGGVÉNYEK
@@ -198,6 +192,16 @@ bool GetReferencePosition(short& outX, short& outY)
     return true;
 }
 
+// Aktív hangok kezelése a térben
+struct Active3DSound {
+    IXAudio2SourceVoice* pSourceVoice;
+    int targetMobIndex;
+    bool bActive;
+};
+
+std::vector<Active3DSound> g_ActiveSounds;
+std::mutex g_SoundMutex;
+
 // ---------------------------------------------------------------------------
 //  MINIMÁLIS WAV BETÖLTŐ AZ XAUDIO2-HÖZ
 // ---------------------------------------------------------------------------
@@ -266,68 +270,93 @@ void Play3DSoundEffect(const char* filename, int mobIndex) {
 
 
 // ---------------------------------------------------------------------------
-//  FINOMHANGOLT 3D AUDIO PANNING SZÁMÍTÓ (AudioWatcherThread JAVÍTÁS)
+//  FINOMHANGOLT 3D WATCHER THREAD (v3.1.5 - STABILIZÁLT)
 // ---------------------------------------------------------------------------
 DWORD WINAPI AudioWatcherThread(LPVOID lpParam)
 {
-    // [Az inicializációs ellenőrző ciklusod változatlanul fut ide...]
+    while (true) {
+        if (g_audio_ready && IsReadable((void*)OBJECT_LIST_BASE, sizeof(uintptr_t))) {
+            uintptr_t listPtr = *(uintptr_t*)OBJECT_LIST_BASE;
+            if (IsReadable((void*)listPtr, OBJECT_STRUCT_SIZE * 2)) break;
+        }
+        Sleep(100);
+    }
 
     while (g_audio_ready)
     {
-        Sleep(16); // ~60 FPS frissítés
+        Sleep(16); // ~60 FPS frissítési frekvencia
 
         short refX = 0, refY = 0;
         if (!GetReferencePosition(refX, refY)) continue;
 
+        // JAVÍTÁS: Ha a játék épp tölt és a pozíciónk 0,0, kihagyjuk a ciklust, nehogy elrontsa a teret
+        if (refX == 0 && refY == 0) continue;
+
         uintptr_t listPtr = *(uintptr_t*)OBJECT_LIST_BASE;
+        if (!IsReadable((void*)listPtr, OBJECT_STRUCT_SIZE * 400)) continue;
 
         std::lock_guard<std::mutex> lock(g_SoundMutex);
 
-        // Végigpörgetjük az éppen futó 3D hangokat
-        for (auto it = g_Active3DSounds.begin(); it != g_Active3DSounds.end(); )
+        // Végigpörgetjük az összes éppen lejátszás alatt lévő XAudio2 hangunkat
+        for (auto it = g_ActiveSounds.begin(); it != g_ActiveSounds.end(); )
         {
             XAUDIO2_VOICE_STATE state;
             it->pSourceVoice->GetState(&state);
 
-            // Ha a hang lefutott, takarítunk
+            // Ha a hangeffekt véget ért, töröljük a csatornát
             if (state.SamplesPlayed == 0 && state.BuffersQueued == 0) {
                 it->pSourceVoice->DestroyVoice();
-                it = g_Active3DSounds.erase(it);
+                it = g_ActiveSounds.erase(it);
                 continue;
             }
 
-            // Lekérjük a hanghoz rendelt mob aktuális koordinátáit
-            uintptr_t entry = listPtr + (it->targetMobIndex * OBJECT_STRUCT_SIZE);
+            // Lekérjük az adott hanghoz rendelt szörny aktuális koordinátáit
+            int i = it->targetMobIndex;
+            uintptr_t entry = listPtr + (i * OBJECT_STRUCT_SIZE);
+
             if (IsReadable((void*)entry, OBJECT_STRUCT_SIZE))
             {
                 short mobX = *(short*)(entry + 0xAC);
                 short mobY = *(short*)(entry + 0xB0);
 
-                // Matematikailag tiszta Listener és Emitter beállítás
+                // JAVÍTÁS: Ha a mob koordinátája 0,0 (vagyis inaktív/halott slot), ne számoljunk rá térhatást
+                if (mobX == 0 && mobY == 0) {
+                    it->pSourceVoice->SetVolume(0.0f); // Elnémítjuk
+                    ++it;
+                    continue;
+                }
+
+                // Tiszta matematikai távolság
+                float distance = sqrtf(powf((float)mobX - (float)refX, 2.0f) + powf((float)mobY - (float)refY, 2.0f));
+
+                // Listener (Játékos - Fixen az idx=1-es sloton ül!)
                 X3DAUDIO_LISTENER listener = {};
                 listener.Position.x = (float)refX;
+                listener.Position.y = 0.0f;
                 listener.Position.z = (float)refY;
-                listener.OrientFront.z = 1.0f; // Szigorúan normalizált 1.0f irányvektorok!
+                listener.OrientFront.z = 1.0f; // Szigorúan normalizált egységvektor
                 listener.OrientTop.y = 1.0f;
 
+                // Emitter (A hangot kiadó szörny)
                 X3DAUDIO_EMITTER emitter = {};
                 emitter.Position.x = (float)mobX;
+                emitter.Position.y = 0.0f;
                 emitter.Position.z = (float)mobY;
                 emitter.OrientFront.z = 1.0f;
                 emitter.OrientTop.y = 1.0f;
-                emitter.ChannelCount = 1; // Szigorúan 1 csatorna pontszerű forráshoz!
-                emitter.CurveDistanceScaler = 1.0f;
+                emitter.ChannelCount = 1;         // MONO forrás (köszönhetően az ffmpeg szkriptednek!)
+                emitter.CurveDistanceScaler = 0.05f; // Finomhangolt gördülési skála a MU léptékéhez
 
                 X3DAUDIO_DSP_SETTINGS dsp = {};
-                float matrix[2] = { 1.0f, 1.0f };
-                dsp.SrcChannelCount = 1; // 1 csatornás bemenet
-                dsp.DstChannelCount = 2; // 2 csatornás sztereó kimenet
-                dsp.pMatrixCoefficients = matrix;
+                float matrixCoefficients[2] = { 1.0f, 1.0f }; // Tiszta sztereó alap
+                dsp.SrcChannelCount = 1;
+                dsp.DstChannelCount = 2;
+                dsp.pMatrixCoefficients = matrixCoefficients;
 
-                // Térbeli hangerő és balansz kiszámítása
+                // X3DAudio kalkuláció futtatása (Mátrix + Hangerő csillapítás távolság alapján)
                 X3DAudioCalculate(g_x3d, &listener, &emitter, X3DAUDIO_CALCULATE_MATRIX | X3DAUDIO_CALCULATE_VOLUME, &dsp);
 
-                // Mátrix és hangerő alkalmazása az AKTÍV hangra
+                // Élesítés a hardveren: Megjelenik a Bal/Jobb panning és a távolsági halkulás!
                 it->pSourceVoice->SetOutputMatrix(g_master, 1, 2, dsp.pMatrixCoefficients);
                 it->pSourceVoice->SetVolume(dsp.Volume);
             }
