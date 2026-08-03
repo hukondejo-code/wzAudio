@@ -463,20 +463,181 @@ public:
 
 CWzAudioImpl g_AudioInstance;
 
+#include <unknwn.h>
+
+// Előzetes deklarációk DirectSound interfészekhez (ha a dsound.h nem lenne teljesen behúzva)
+DEFINE_GUID(IID_IDirectSound, 0x279AFA83, 0x4981, 0x11CE, 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60);
+DEFINE_GUID(IID_IDirectSound8, 0xC50A7E16, 0x0F92, 0x402E, 0x94, 0x24, 0x54, 0x59, 0x1E, 0x63, 0x14, 0x19);
+
+// Szükséges DirectSound struktúrák stubolása
+struct DSBUFFERDESC {
+    DWORD dwSize;
+    DWORD dwFlags;
+    DWORD dwBufferBytes;
+    DWORD dwReserved;
+    WAVEFORMATEX* lpwfxFormat;
+    GUID guid3DAlgorithm;
+};
+
+// --- 1. IDirectSoundBuffer Wrapper ---
+class MyDirectSoundBuffer : public IUnknown {
+public:
+    IUnknown* m_pRealBuffer;
+    WAVEFORMATEX m_wfx;
+    std::vector<BYTE> m_audioData;
+    int m_assumedMobIndex;
+
+    MyDirectSoundBuffer(IUnknown* pReal, const DSBUFFERDESC* pDesc) {
+        m_pRealBuffer = pReal;
+        m_assumedMobIndex = -1;
+        if (pDesc && pDesc->lpwfxFormat) {
+            m_wfx = *(pDesc->lpwfxFormat);
+        }
+        else {
+            ZeroMemory(&m_wfx, sizeof(WAVEFORMATEX));
+        }
+    }
+
+    // COM szabványos metódusok leképzése
+    HRESULT __stdcall QueryInterface(REFIID riid, void** ppvObj) { return m_pRealBuffer->QueryInterface(riid, ppvObj); }
+    ULONG __stdcall AddRef() { return m_pRealBuffer->AddRef(); }
+    ULONG __stdcall Release() {
+        ULONG res = m_pRealBuffer->Release();
+        if (res == 0) { delete this; return 0; }
+        return res;
+    }
+
+    // A DirectSound puffer írásakor a játék ide másolja a hangmintát (.wav nyers tartalmát)
+    HRESULT __stdcall Lock(DWORD dwWriteCursor, DWORD dwWriteBytes, void** ppvAudioPtr1, DWORD* pdwAudioBytes1, void** ppvAudioPtr2, DWORD* pdwAudioBytes2, DWORD dwFlags) {
+        // Meghívjuk az eredeti DirectSound lockot, hogy a játék azt higgye, minden a megszokott
+        typedef HRESULT(__stdcall* Lock_t)(void*, DWORD, DWORD, void**, DWORD*, void**, DWORD*, DWORD);
+        HRESULT hr = ((Lock_t)(*(void***)m_pRealBuffer)[11])(m_pRealBuffer, dwWriteCursor, dwWriteBytes, ppvAudioPtr1, pdwAudioBytes1, ppvAudioPtr2, pdwAudioBytes2, dwFlags);
+        return hr;
+    }
+
+    HRESULT __stdcall Unlock(void* pvAudioPtr1, DWORD dwAudioBytes1, void* pvAudioPtr2, DWORD dwAudioBytes2) {
+        // Elmentjük a hangmintát a memóriába, hogy az XAudio2-nek odaadhassuk
+        if (pvAudioPtr1 && dwAudioBytes1 > 0) {
+            m_audioData.resize(dwAudioBytes1);
+            memcpy(m_audioData.data(), pvAudioPtr1, dwAudioBytes1);
+        }
+        typedef HRESULT(__stdcall* Unlock_t)(void*, void*, DWORD, void*, DWORD);
+        return ((Unlock_t)(*(void***)m_pRealBuffer)[12])(m_pRealBuffer, pvAudioPtr1, dwAudioBytes1, pvAudioPtr2, dwAudioBytes2);
+    }
+
+    // KRITIKUS PONT: Amikor a játék elindítja a hangot (Play)
+    HRESULT __stdcall Play(DWORD dwReserved1, DWORD dwPriority, DWORD dwFlags) {
+        // Ha a hang érvényes mono hang (az ffmpeg scriptből), átirányítjuk az XAudio2 Poolunkba!
+        if (!m_audioData.empty() && m_wfx.nChannels == 1) {
+            // Megpróbáljuk kitalálni a szörny indexét. 
+            // Ha a játék korábban nem lőtte be a pozíciót, alapértelmezetten a legközelebbi aktív szörnyhöz rendeljük.
+            if (m_assumedMobIndex == -1) {
+                m_assumedMobIndex = FindClosestMobIndex();
+            }
+
+            // Lejátszás az új XAudio2 3D motorunkon keresztül!
+            PlayXAudio3DEffect(m_audioData.data(), m_audioData.size(), &m_wfx, m_assumedMobIndex);
+            return 0; // DS_OK - Elhiteltetjük a játékkal, hogy a DirectSound sikeresen lejátszotta
+        }
+
+        // Ha sztereó vagy zenei fájl maradt, hagyjuk a gyári DirectSound-on szólni
+        typedef HRESULT(__stdcall* Play_t)(void*, DWORD, DWORD, DWORD);
+        return ((Play_t)(*(void***)m_pRealBuffer)[13])(m_pRealBuffer, dwReserved1, dwPriority, dwFlags);
+    }
+
+    // Segédfüggvény: megkeresi az idx=1 (Player)-hez legközelebbi aktív szörnyet a hang indításakor
+    int FindClosestMobIndex() {
+        short refX = 0, refY = 0;
+        if (!GetReferencePosition(refX, refY)) return 0;
+        uintptr_t listPtr = *(uintptr_t*)OBJECT_LIST_BASE;
+        if (!IsReadable((void*)listPtr, OBJECT_STRUCT_SIZE * 400)) return 0;
+
+        int closestIdx = 0;
+        float minDistance = 999.0f;
+
+        for (int i = 0; i < 400; i++) {
+            if (i == 1) continue; // A saját karakterünket kihagyjuk a keresésből
+            uintptr_t entry = listPtr + (i * OBJECT_STRUCT_SIZE);
+            if (IsReadable((void*)entry, OBJECT_STRUCT_SIZE)) {
+                short mX = *(short*)(entry + 0xAC);
+                short mY = *(short*)(entry + 0xB0);
+                if (mX == 0 && mY == 0) continue;
+
+                float dist = sqrtf(powf((float)mX - (float)refX, 2.0f) + powf((float)mY - (float)refY, 2.0f));
+                if (dist < minDistance) {
+                    minDistance = dist;
+                    closestIdx = i;
+                }
+            }
+        }
+        return closestIdx;
+    }
+};
+
+// --- 2. IDirectSound Wrapper ---
+class MyDirectSound : public IUnknown {
+public:
+    IUnknown* m_pRealDS;
+    MyDirectSound(IUnknown* pReal) { m_pRealDS = pReal; }
+
+    HRESULT __stdcall QueryInterface(REFIID riid, void** ppvObj) { return m_pRealDS->QueryInterface(riid, ppvObj); }
+    ULONG __stdcall AddRef() { return m_pRealDS->AddRef(); }
+    ULONG __stdcall Release() {
+        ULONG res = m_pRealDS->Release();
+        if (res == 0) { delete this; return 0; }
+        return res;
+    }
+
+    // Ezt hívja a MU kliens, amikor hangeffekt csatornát akar nyitni
+    HRESULT __stdcall CreateSoundBuffer(const DSBUFFERDESC* pcDSBufferDesc, void** ppDSBuffer, IUnknown* pUnkOuter) {
+        typedef HRESULT(__stdcall* CreateSoundBuffer_t)(void*, const DSBUFFERDESC*, void**, IUnknown*);
+        void* pRealBuffer = nullptr;
+
+        HRESULT hr = ((CreateSoundBuffer_t)(*(void***)m_pRealDS)[3])(m_pRealDS, pcDSBufferDesc, &pRealBuffer, pUnkOuter);
+        if (SUCCEEDED(hr) && pRealBuffer) {
+            // Becsomagoljuk a gyári puffert a saját osztályunkba!
+            MyDirectSoundBuffer* myBuffer = new MyDirectSoundBuffer((IUnknown*)pRealBuffer, pcDSBufferDesc);
+            *ppDSBuffer = (void*)myBuffer;
+            return hr;
+        }
+        return hr;
+    }
+};
+
+
 // ---------------------------------------------------------------------------
 //  DIRECTSOUND HOOKOK
 // ---------------------------------------------------------------------------
 
 HRESULT __stdcall HookedDirectSoundCreate(LPGUID lpGuid, void** ppDS, void* pUnkOuter)
 {
-    if (TrueDirectSoundCreate) return TrueDirectSoundCreate(lpGuid, ppDS, pUnkOuter);
-    return 0x887800F0;
+    if (!TrueDirectSoundCreate) return 0x887800F0;
+
+    void* pRealDS = nullptr;
+    HRESULT hr = TrueDirectSoundCreate(lpGuid, &pRealDS, pUnkOuter);
+    if (SUCCEEDED(hr) && pRealDS) {
+        // A kliensnek a mi MyDirectSound wrapperünket adjuk vissza a gyári helyett
+        MyDirectSound* myDS = new MyDirectSound((IUnknown*)pRealDS);
+        *ppDS = (void*)myDS;
+        LogWithTimestamp("[wzAudio] DirectSound sikeresen wrappelve az XAudio2-höz!");
+        return hr;
+    }
+    return hr;
 }
 
 HRESULT __stdcall HookedDirectSoundCreate8(LPGUID lpGuid, void** ppDS8, void* pUnkOuter)
 {
-    if (TrueDirectSoundCreate8) return TrueDirectSoundCreate8(lpGuid, ppDS8, pUnkOuter);
-    return 0x887800F0;
+    if (!TrueDirectSoundCreate8) return 0x887800F0;
+
+    void* pRealDS8 = nullptr;
+    HRESULT hr = TrueDirectSoundCreate8(lpGuid, &pRealDS8, pUnkOuter);
+    if (SUCCEEDED(hr) && pRealDS8) {
+        MyDirectSound* myDS8 = new MyDirectSound((IUnknown*)pRealDS8);
+        *ppDS8 = (void*)myDS8;
+        LogWithTimestamp("[wzAudio] DirectSound8 sikeresen wrappelve az XAudio2-höz!");
+        return hr;
+    }
+    return hr;
 }
 
 void HookDirectSoundAPI()
