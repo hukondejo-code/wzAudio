@@ -214,7 +214,6 @@ void PlayXAudio3DEffect(const BYTE* pWaveData, DWORD dataSize, WAVEFORMATEX* pWf
 
     std::lock_guard<std::mutex> lock(g_VoicePoolMutex);
 
-    // Keresünk egy szabad slotot a pool-ban
     int freeSlot = -1;
     for (int i = 0; i < MAX_VOICE_POOL; i++) {
         if (!g_VoicePool[i].bInUse) {
@@ -222,7 +221,6 @@ void PlayXAudio3DEffect(const BYTE* pWaveData, DWORD dataSize, WAVEFORMATEX* pWf
             break;
         }
         else {
-            // Ha már fut, ellenőrizzük, hogy lejárt-e
             XAUDIO2_VOICE_STATE state;
             g_VoicePool[i].pSourceVoice->GetState(&state);
             if (state.SamplesPlayed == 0 && state.BuffersQueued == 0) {
@@ -233,6 +231,49 @@ void PlayXAudio3DEffect(const BYTE* pWaveData, DWORD dataSize, WAVEFORMATEX* pWf
             }
         }
     }
+
+    if (freeSlot == -1) return;
+
+    // Szigorúan ellenőrizzük, hogy a beérkező wfx mono (1 csatornás) formátumú-e
+    pWfx->nChannels = 1;
+    pWfx->nBlockAlign = pWfx->wBitsPerSample / 8;
+    pWfx->nAvgBytesPerSec = pWfx->nSamplesPerSec * pWfx->nBlockAlign;
+
+    IXAudio2SourceVoice* pSourceVoice = nullptr;
+    if (SUCCEEDED(g_xaudio->CreateSourceVoice(&pSourceVoice, pWfx, 0, XAUDIO2_DEFAULT_FREQ_RATIO, NULL, NULL, NULL))) {
+
+        // --- 1. JAVÍTÁS: EXPLICIT SZTEREÓ KIMENETI ÚTVONAL BEKÖTÉSE ---
+        XAUDIO2_VOICE_SENDS sendList = { 0 };
+        XAUDIO2_SEND_DESCRIPTOR sendDesc = { 0 };
+        sendDesc.Flags = 0;
+        sendDesc.pOutputVoice = g_master; // Közvetlenül a sztereó mastering voice-ra küldjük
+        sendList.SendCount = 1;
+        sendList.pSends = &sendDesc;
+
+        pSourceVoice->SetOutputVoices(&sendList);
+
+        // --- 2. JAVÍTÁS: INICIALIZÁLÁSKOR AZONNAL KIKÉNYSZERÍTJÜK A NYERS MATRÍXOT ---
+        float initMatrix[2] = { 1.0f, 1.0f }; // Alapértelmezett sztereó együttható
+        pSourceVoice->SetOutputMatrix(g_master, 1, 2, initMatrix);
+
+        XAUDIO2_BUFFER buffer = { 0 };
+        buffer.AudioBytes = dataSize;
+        buffer.pAudioData = pWaveData;
+        buffer.Flags = XAUDIO2_END_OF_STREAM;
+
+        if (SUCCEEDED(pSourceVoice->SubmitSourceBuffer(&buffer))) {
+            pSourceVoice->Start(0);
+
+            g_VoicePool[freeSlot].pSourceVoice = pSourceVoice;
+            g_VoicePool[freeSlot].targetMobIndex = mobIndex;
+            g_VoicePool[freeSlot].bInUse = true;
+        }
+        else {
+            pSourceVoice->DestroyVoice();
+        }
+    }
+
+
 
     // Ha nincs szabad csatorna, eldobjuk a hangot (túlcsordulás védelem)
     if (freeSlot == -1) return;
@@ -609,12 +650,12 @@ extern "C" __declspec(dllexport) void* __cdecl wzAudioCreate() {
 
     if (!g_audio_ready) {
         if (SUCCEEDED(XAudio2Create(&g_xaudio, 0, XAUDIO2_DEFAULT_PROCESSOR))) {
-            if (SUCCEEDED(g_xaudio->CreateMasteringVoice(&g_master))) {
+            // A végén a hibás szűrő konstans helyett 0-t adunk át
+            if (SUCCEEDED(g_xaudio->CreateMasteringVoice(&g_master, 2, 44100, 0, NULL))) {
                 DWORD channelMask = 0;
                 g_master->GetChannelMask(&channelMask);
                 if (channelMask == 0) channelMask = SPEAKER_STEREO;
 
-                // Lekérjük a tényleges hardveres csatornaszámot (ez 2 lesz sztereó fülesnél)
                 XAUDIO2_VOICE_DETAILS details;
                 g_master->GetVoiceDetails(&details);
                 g_masterChannels = details.InputChannels;
