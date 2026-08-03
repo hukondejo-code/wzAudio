@@ -43,14 +43,26 @@ void LogDebug(const char* msg)
     }
 }
 
+void LogWithTimestamp(const char* msg)
+{
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    char line[512];
+    sprintf_s(line,
+        "[%02d:%02d:%02d.%03d] %s",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        msg);
+
+    LogDebug(line);
+}
+
 // ---------------------------------------------------------------------------
 //  IMPORT ADDRESS TABLE (IAT) PATCHING
 // ---------------------------------------------------------------------------
 
-// Ez a függvény átírja a main.exe telefonkönyvét (IAT) módosítás nélkül!
 void PatchImportAddressTable(const char* dllName, const char* functionName, DWORD newFunctionAddress)
 {
-    // Lekérjük a main.exe (vagy a betöltött fő modul) alapcímét a memóriában
     HMODULE hModule = GetModuleHandleA(NULL);
     if (!hModule) return;
 
@@ -60,36 +72,26 @@ void PatchImportAddressTable(const char* dllName, const char* functionName, DWOR
     PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((BYTE*)hModule + dosHeader->e_lfanew);
     if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return;
 
-    // Megkeressük az Import Directory-t
     PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE*)hModule +
         ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
 
     if (!importDesc || (BYTE*)importDesc == (BYTE*)hModule) return;
 
-    // Végigmegyünk az importált DLL-ek listáján
     while (importDesc->Name) {
         const char* name = (const char*)((BYTE*)hModule + importDesc->Name);
 
-        // Ha megtaláltuk a dsound.dll-t
         if (_stricmp(name, dllName) == 0) {
             PIMAGE_THUNK_DATA thunkIAT = (PIMAGE_THUNK_DATA)((BYTE*)hModule + importDesc->FirstThunk);
             PIMAGE_THUNK_DATA thunkOriginal = (PIMAGE_THUNK_DATA)((BYTE*)hModule + importDesc->Characteristics);
 
             while (thunkIAT->u1.Function) {
-                // Megkeressük a függvény nevét
                 if (thunkOriginal && !(thunkOriginal->u1.Ordinal & IMAGE_ORDINAL_FLAG)) {
                     PIMAGE_IMPORT_BY_NAME importName = (PIMAGE_IMPORT_BY_NAME)((BYTE*)hModule + thunkOriginal->u1.AddressOfData);
 
-                    // Megvan a DirectSoundCreate!
                     if (strcmp((const char*)importName->Name, functionName) == 0) {
                         DWORD oldProtect;
-                        // Feloldjuk az írásvédettséget a játék belső táblázatában
                         VirtualProtect(&thunkIAT->u1.Function, sizeof(DWORD), PAGE_READWRITE, &oldProtect);
-
-                        // Kicseréljük a címet a saját XAudio2 alapú proxy függvényünkre!
                         thunkIAT->u1.Function = newFunctionAddress;
-
-                        // Visszaállítjuk a védelmet
                         VirtualProtect(&thunkIAT->u1.Function, sizeof(DWORD), oldProtect, &oldProtect);
                         return;
                     }
@@ -102,10 +104,10 @@ void PatchImportAddressTable(const char* dllName, const char* functionName, DWOR
     }
 }
 
-
 // ---------------------------------------------------------------------------
 //  GLOBÁLIS VÁLTOZÓK (MCI ZENE + XAUDIO EFFECT)
 // ---------------------------------------------------------------------------
+
 std::string g_CurrentTrack = "";
 std::string g_RequestedTrack = "";
 HWND g_HwndMCI = NULL;
@@ -123,105 +125,197 @@ uintptr_t PLAYER_INDEX_ADDR = 0x0091F830;
 typedef HRESULT(__stdcall* DirectSoundCreate_t)(LPGUID, void**, void*);
 DirectSoundCreate_t TrueDirectSoundCreate = nullptr;
 
-// UN DIFFERENCE: DirectSound8 mentése (Ez hiányzott!)
+// DirectSoundCreate8 mentése
 typedef HRESULT(__stdcall* DirectSoundCreate8_t)(LPGUID, void**, void*);
 DirectSoundCreate8_t TrueDirectSoundCreate8 = nullptr;
 
 // ---------------------------------------------------------------------------
-//  BIZTONSÁGOS MEMÓRIA-POZÍCIÓ LEKÉRDEZÉS
+//  BIZTONSÁGOS MEMÓRIA-ELLENŐRZÉS (VirtualQuery ALAPÚ)
 // ---------------------------------------------------------------------------
-bool GetObjectPosition(int index, float& outX, float& outY) {
-    if (index < 0) return false;
-    if (IsBadReadPtr((void*)OBJECT_LIST_BASE, sizeof(uintptr_t))) return false;
-    uintptr_t listPtr = *(uintptr_t*)OBJECT_LIST_BASE;
-    if (listPtr == 0) return false;
-    uintptr_t entry = listPtr + ((size_t)index * OBJECT_STRUCT_SIZE);
-    if (IsBadReadPtr((void*)entry, OBJECT_STRUCT_SIZE)) return false;
 
-    outX = (float)(*(int*)(entry + 0x10));
-    outY = (float)(*(int*)(entry + 0x14));
+bool IsReadable(void* ptr, size_t size)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(ptr, &mbi, sizeof(mbi)) == 0)
+        return false;
+
+    if (mbi.State != MEM_COMMIT)
+        return false;
+
+    if (mbi.Protect & PAGE_NOACCESS)
+        return false;
+
+    if (mbi.Protect & PAGE_GUARD)
+        return false;
+
+    uintptr_t start = (uintptr_t)ptr;
+    uintptr_t end = start + size;
+    uintptr_t regionEnd = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+
+    if (end > regionEnd)
+        return false;
+
     return true;
-
 }
 
 // ---------------------------------------------------------------------------
-//  FINOMHANGOLT 3D AUDIO PANNING SZÁMÍTÓ (BIZTONSÁGI FALLBACK-EKEL)
+//  STABIL REFERENCIAPONT (PLAYER KÖZELI MOB) LEKÉRDEZÉSE
 // ---------------------------------------------------------------------------
-// Globális változó az XAudio2 hangforráshoz (effektekhez)
+
+bool GetReferencePosition(short& outX, short& outY)
+{
+    if (!IsReadable((void*)OBJECT_LIST_BASE, sizeof(uintptr_t)))
+        return false;
+
+    uintptr_t listPtr = *(uintptr_t*)OBJECT_LIST_BASE;
+    if (!IsReadable((void*)listPtr, OBJECT_STRUCT_SIZE))
+        return false;
+
+    // idx=1 – az első érvényes mob / NPC, jellemzően a player közelében
+    uintptr_t entry = listPtr + (1 * OBJECT_STRUCT_SIZE);
+
+    if (!IsReadable((void*)(entry + 0xAC), sizeof(short)))
+        return false;
+
+    if (!IsReadable((void*)(entry + 0xB0), sizeof(short)))
+        return false;
+
+    outX = *(short*)(entry + 0xAC);
+    outY = *(short*)(entry + 0xB0);
+
+    char dbg[128];
+    sprintf_s(dbg, "[PLAYERREF] X=%d Y=%d", outX, outY);
+    LogWithTimestamp(dbg);
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+//  FINOMHANGOLT 3D AUDIO PANNING SZÁMÍTÓ (REFERENCIAPONT-LOGIKA)
+// ---------------------------------------------------------------------------
+
 IXAudio2SourceVoice* g_3d_voice = nullptr;
 
-// EZ A HÁTTÉRSZÁL FÜGGVÉNY: Folyamatosan figyel és számol a háttérben
 DWORD WINAPI AudioWatcherThread(LPVOID lpParam)
 {
-    // Megvárjuk, amíg a játék ténylegesen betölti az objektumlistát a memóriába
-    while (!g_audio_ready || IsBadReadPtr((void*)PLAYER_INDEX_ADDR, sizeof(int))) {
-        Sleep(500);
+    // Megvárjuk, amíg az audio rendszer és az objektumlista stabilan elérhető
+    while (true)
+    {
+        if (!g_audio_ready)
+        {
+            Sleep(500);
+            continue;
+        }
+
+        if (!IsReadable((void*)OBJECT_LIST_BASE, sizeof(uintptr_t)))
+        {
+            Sleep(500);
+            continue;
+        }
+
+        uintptr_t listPtr = *(uintptr_t*)OBJECT_LIST_BASE;
+        if (!IsReadable((void*)listPtr, OBJECT_STRUCT_SIZE))
+        {
+            Sleep(500);
+            continue;
+        }
+
+        uintptr_t entry = listPtr + (1 * OBJECT_STRUCT_SIZE);
+        if (!IsReadable((void*)entry, OBJECT_STRUCT_SIZE))
+        {
+            Sleep(500);
+            continue;
+        }
+
+        if (!IsReadable((void*)(entry + 0xAC), sizeof(short)) ||
+            !IsReadable((void*)(entry + 0xB0), sizeof(short)))
+        {
+            Sleep(500);
+            continue;
+        }
+
+        break;
     }
-    // VÉGTELEN CIKLUS - Amíg fut a játék, ez a szál 20 ezredmásodpercenként dolgozik
+
     while (g_audio_ready)
     {
-        Sleep(20); // ~50 FPS frissítési ráta a hang pozicionáláshoz
+        Sleep(20); // ~50 FPS frissítési ráta
 
-        int playerIndex = *(int*)PLAYER_INDEX_ADDR;
-        float playerX = 0, playerY = 0;
-
-        if (!GetObjectPosition(playerIndex, playerX, playerY)) continue;
+        short refX = 0, refY = 0;
+        if (!GetReferencePosition(refX, refY))
+            continue;
 
         // Végigpörgetjük az ObjectList aktív szörnyeit (például az első 400 slotot)
+        if (!IsReadable((void*)OBJECT_LIST_BASE, sizeof(uintptr_t)))
+            continue;
+
+        uintptr_t listPtr = *(uintptr_t*)OBJECT_LIST_BASE;
+        if (!IsReadable((void*)listPtr, OBJECT_STRUCT_SIZE * 400))
+            continue;
+
         for (int i = 0; i < 400; i++)
         {
-            if (i == playerIndex) continue; // A játékost kihagyjuk
+            uintptr_t entry = listPtr + (i * OBJECT_STRUCT_SIZE);
 
-            float mobX = 0, mobY = 0;
-            if (GetObjectPosition(i, mobX, mobY))
+            if (!IsReadable((void*)entry, OBJECT_STRUCT_SIZE))
+                continue;
+
+            if (!IsReadable((void*)(entry + 0xAC), sizeof(short)) ||
+                !IsReadable((void*)(entry + 0xB0), sizeof(short)))
+                continue;
+
+            short mobX = *(short*)(entry + 0xAC);
+            short mobY = *(short*)(entry + 0xB0);
+
+            float distance = sqrtf(
+                powf((float)mobX - (float)refX, 2.0f) +
+                powf((float)mobY - (float)refY, 2.0f)
+            );
+
+            if (distance < 30.0f)
             {
-                // TŰPONTOS TÁVOLSÁGSZÁMÍTÁS (Pitagorasz-tétel)
-                float distance = sqrtf(powf(mobX - playerX, 2) + powf(mobY - playerY, 2));
+                char debugMsg[256];
+                sprintf_s(debugMsg,
+                    "[wzAudio] Mob=%d | Dist=%.1f | RefX=%d, RefY=%d | MobX=%d, MobY=%d",
+                    i, (double)distance, (int)refX, (int)refY, (int)mobX, (int)mobY);
+                LogWithTimestamp(debugMsg);
 
-                // Ha a szörny a hallótávolságon belül van (pl. 30 koordináta egység a MU-ban)
-                if (distance < 30.0f)
-                {  
-                    // === !!! EZT A LOG BLOKKOT ILLESZD BE IDE !!! ===
-                    char debugMsg[256];
-                    sprintf_s(debugMsg, "[wzAudio] Mob=%d | Dist=%.1f | PlayerX=%.1f, Y=%.1f | MobX=%.1f, Y=%.1f\n",
-                        i, distance, playerX, playerY, mobX, mobY);
+                if (g_3d_voice)
+                {
+                    X3DAUDIO_LISTENER listener = {};
+                    listener.Position.x = (float)refX;
+                    listener.Position.z = (float)refY;
+                    listener.OrientFront.z = 1.0f;
+                    listener.OrientTop.y = 1.0f;
 
-                    // ===============================================
-                   
-                    // Ha a játék elindított egy effekt hangot ezen a csatornán (g_3d_voice)
-                    if (g_3d_voice)
-                    {
-                        X3DAUDIO_LISTENER listener = {};
-                        listener.Position.x = playerX; listener.Position.z = playerY;
-                        listener.OrientFront.z = 1.0f; listener.OrientTop.y = 1.0f;
+                    X3DAUDIO_EMITTER emitter = {};
+                    emitter.Position.x = (float)mobX;
+                    emitter.Position.z = (float)mobY;
+                    emitter.OrientFront.z = 1.0f;
+                    emitter.OrientTop.y = 1.0f;
+                    emitter.ChannelCount = 1;
+                    emitter.CurveDistanceScaler = 0.12f;
 
-                        X3DAUDIO_EMITTER emitter = {};
-                        emitter.Position.x = mobX; emitter.Position.z = mobY;
-                        emitter.OrientFront.z = 1.0f; emitter.OrientTop.y = 1.0f;
-                        emitter.ChannelCount = 1;
-                        emitter.CurveDistanceScaler = 0.12f; // Szuper érzékeny izometrikus skálázás
+                    X3DAUDIO_DSP_SETTINGS dsp = {};
+                    float matrix[2] = { 0.0f, 0.0f };
+                    dsp.SrcChannelCount = 1;
+                    dsp.DstChannelCount = 2;
+                    dsp.pMatrixCoefficients = matrix;
 
-                        X3DAUDIO_DSP_SETTINGS dsp = {};
-                        float matrix[2] = { 0.0f, 0.0f };
-                        dsp.SrcChannelCount = 1; dsp.DstChannelCount = 2;
-                        dsp.pMatrixCoefficients = matrix;
-
-                        // Kiszámoljuk a 3D teret élőben a szörnyhöz!
-                        X3DAudioCalculate(g_x3d, &listener, &emitter, X3DAUDIO_CALCULATE_MATRIX, &dsp);
-
-                        // Alkalmazzuk a mátrixot az XAudio2-re
-                        g_3d_voice->SetOutputMatrix(g_master, 1, 2, dsp.pMatrixCoefficients);
-                    }
+                    X3DAudioCalculate(g_x3d, &listener, &emitter, X3DAUDIO_CALCULATE_MATRIX, &dsp);
+                    g_3d_voice->SetOutputMatrix(g_master, 1, 2, dsp.pMatrixCoefficients);
                 }
             }
         }
     }
+
     return 0;
 }
 
 // ---------------------------------------------------------------------------
-//  EREDETI WZAUDIO 2.0 ZENEI FÜGGVÉNYEK (VÁLTOZATLANUL - GARANTÁLTAN MŰKÖDIK)
+//  EREDETI WZAUDIO 2.0 ZENEI FÜGGVÉNYEK
 // ---------------------------------------------------------------------------
+
 int GetMusicVolumeFromRegistry() {
     HKEY hKey; DWORD musicVolume = 9; DWORD dataSize = sizeof(musicVolume);
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Webzen\\Mu\\Config", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
@@ -286,6 +380,7 @@ void CreateMCIHelperWindow() {
 // ---------------------------------------------------------------------------
 //  WEBZEN VTABLE INTERFÉSZ ÉS IMPLEMENTÁCIÓ
 // ---------------------------------------------------------------------------
+
 class IWzAudio {
 public:
     virtual int  __thiscall GetStreamOffsetRange(int unk1, int unk2) = 0;
@@ -334,68 +429,55 @@ public:
 
 CWzAudioImpl g_AudioInstance;
 
+// ---------------------------------------------------------------------------
+//  DIRECTSOUND HOOKOK
+// ---------------------------------------------------------------------------
+
 HRESULT __stdcall HookedDirectSoundCreate(LPGUID lpGuid, void** ppDS, void* pUnkOuter)
 {
-    // Ha a játék a régi DirectSound-ot kéri, a valódi régi függvényt hívjuk meg
     if (TrueDirectSoundCreate) return TrueDirectSoundCreate(lpGuid, ppDS, pUnkOuter);
-    return  0x887800F0; // Ez a DSERR_GENERIC pontos hexadecimális értéke!
-}   
+    return 0x887800F0;
+}
 
 HRESULT __stdcall HookedDirectSoundCreate8(LPGUID lpGuid, void** ppDS8, void* pUnkOuter)
 {
-    // !!! JAVÍTVA !!! Ha a játék a DirectSound8-at kéri, a valódi DirectSound8-at hívjuk meg!
     if (TrueDirectSoundCreate8) return TrueDirectSoundCreate8(lpGuid, ppDS8, pUnkOuter);
-    return  0x887800F0; // Ez a DSERR_GENERIC pontos hexadecimális értéke!
+    return 0x887800F0;
 }
 
-// EZ AZ A FÜGGVÉNY, AMI ÖSSZEKÖTI A KETTŐT MODIFICATION NÉLKÜL
 void HookDirectSoundAPI()
 {
     HMODULE hDsound = GetModuleHandleA("dsound.dll");
     if (!hDsound) hDsound = LoadLibraryA("dsound.dll");
 
     if (hDsound) {
-        // Kimentjük a valódi DirectSoundCreate címet
         TrueDirectSoundCreate = (DirectSoundCreate_t)GetProcAddress(hDsound, "DirectSoundCreate");
-
-        // Kimentjük a valódi DirectSoundCreate8 címet is!
         TrueDirectSoundCreate8 = (DirectSoundCreate8_t)GetProcAddress(hDsound, "DirectSoundCreate8");
     }
 }
 
-// =========================================================================
-// S9 ÉS ÚJABB SZEZONOK HIÁNYZÓ EXPORTÁLT FÜGGVÉNYEI (A TE STUBJAID)
-// =========================================================================
+// ---------------------------------------------------------------------------
+//  S9+ STUB EXPORTOK
+// ---------------------------------------------------------------------------
 
-// Visszaadja a hangfolyam információit (0 = sikeres/nincs hiba)
 extern "C" __declspec(dllexport) int __cdecl wzAudioGetStreamInfo(int unk1, int unk2) { return 0; }
-// Visszaadja a folyam eltolódását másodpercben
 extern "C" __declspec(dllexport) int __cdecl wzAudioGetStreamOffsetSec(int unk1) { return 0; }
-// Lekéri az aktuális hangerőt (visszaadjuk a registry-ből olvasott értéket, vagy fix 9-et)
 extern "C" __declspec(dllexport) int __cdecl wzAudioGetVolume() { return GetMusicVolumeFromRegistry(); }
-// Fájlmegnyitási stub, az MCI open intézi helyette, így itt csak sikert (1) adunk vissza
 extern "C" __declspec(dllexport) int __cdecl wzAudioOpenFile(const char* filePath) { return 1; }
-// Zene szüneteltetése (opcionális, ha a kliens hívná, mci paranccsal leállítható)
 extern "C" __declspec(dllexport) int __cdecl wzAudioPause() { mciSendStringA("pause my_mp3", NULL, 0, NULL); return 1; }
-// Pozicionálás a zenében
 extern "C" __declspec(dllexport) int __cdecl wzAudioSeek(int position) { return 1; }
-// Hangszínszabályzó (Equalizer) beállítása (0 = kikapcsolva/alapértelmezett)
 extern "C" __declspec(dllexport) int __cdecl wzAudioSetEqualizer(int eqMode) { return 0; }
-// !!! A LEGGYANÚSABB BŰNÖS !!! Keverő mód beállítása.
-// Ha ezt nem találja vagy hibát ad, azt hiszi, nincs hardver. Fix 1-et (sikeres) adunk vissza!
 extern "C" __declspec(dllexport) int __cdecl wzAudioSetMixerMode(int mode) { return 1; }
-// Hangerő csökkentése billentyűkombinációra
 extern "C" __declspec(dllexport) int __cdecl wzAudioVolumeDown() { return 1; }
-// Hangerő növelése billentyűkombinációra
 extern "C" __declspec(dllexport) int __cdecl wzAudioVolumeUp() { return 1; }
 
-// =========================================================================
-// WZAUDIO ALAP EXPORT FÜGGVÉNYEK
-// =========================================================================
+// ---------------------------------------------------------------------------
+//  WZAUDIO ALAP EXPORT FÜGGVÉNYEK
+// ---------------------------------------------------------------------------
+
 extern "C" __declspec(dllexport) void* __cdecl wzAudioCreate() {
     mciSendStringA("close all", NULL, 0, NULL);
 
-    // Az ÚJ XAUDIO2 + X3DAUDIO INITIALIZÁLÁS (Garantálja a 3D-t)
     if (!g_audio_ready) {
         if (SUCCEEDED(XAudio2Create(&g_xaudio, 0, XAUDIO2_DEFAULT_PROCESSOR))) {
             if (SUCCEEDED(g_xaudio->CreateMasteringVoice(&g_master))) {
@@ -410,8 +492,6 @@ extern "C" __declspec(dllexport) void* __cdecl wzAudioCreate() {
 
     CreateMCIHelperWindow();
 
-    // ELINDÍTJUK AZ AUDIO FIGYELŐT: Ez létrehoz egy teljesen különálló szálat a CPU-ban,
-    // ami a háttérben, a játék akadozása nélkül végzi a 3D számításokat!
     CreateThread(NULL, 0, AudioWatcherThread, NULL, 0, NULL);
 
     return &g_AudioInstance;
@@ -434,18 +514,17 @@ extern "C" __declspec(dllexport) int __cdecl wzAudioDestroy() {
     return 1;
 }
 
-// =========================================================================
-// DLL ASZINKRON IDŐZÍTETT INDÍTÁSA (A 3D AUDIO SZENT GRÁLJA)
-// =========================================================================
+// ---------------------------------------------------------------------------
+//  DLLMAIN – LOGGER + HOOKOK
+// ---------------------------------------------------------------------------
+
 BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
         DisableThreadLibraryCalls(hInst);
         InitLogger();
-        HookDirectSoundAPI(); // Mentjük a címeket
-        // Amint a wzAudio.dll betöltődik, AZONNAL átírjuk a játék belső táblázatát!
-        // Kicseréljük a dsound.dll "DirectSoundCreate" parancsát a mi saját Proxy-nkra.
+        HookDirectSoundAPI();
         PatchImportAddressTable("dsound.dll", "DirectSoundCreate", (DWORD)HookedDirectSoundCreate);
         PatchImportAddressTable("dsound.dll", "DirectSoundCreate8", (DWORD)HookedDirectSoundCreate8);
     }
