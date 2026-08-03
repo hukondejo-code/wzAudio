@@ -13,6 +13,7 @@ EXPORTS
     wzAudioSeek                    @11
     wzAudioSetEqualizer            @12
     wzAudioSetMixerMode            @13
-
+    wzAudioSetVolume               @14
+    wzAudioStop                    @15
     wzAudioVolumeDown              @16
     wzAudioVolumeUp                @17

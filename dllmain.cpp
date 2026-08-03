@@ -300,31 +300,24 @@ void PlayXAudio3DEffect(const BYTE* pWaveData, DWORD dataSize, WAVEFORMATEX* pWf
 }
 
 // ---------------------------------------------------------------------------
-//  VÉGLEGES, JAVÍTOTT WATCHER THREAD (v3.2.1)
+//  VÉGLEGES, JAVÍTOTT WATCHER THREAD (v3.3.0)
 // ---------------------------------------------------------------------------
 DWORD WINAPI AudioWatcherThread(LPVOID lpParam)
 {
-    // KŐKEMÉNY CIKLUS: Addig nem engedjük tovább a szálat, amíg a karakter be nem tölt (X és Y nem 0!)
-    while (true)
-    {
+    while (true) {
         short tx = 0, ty = 0;
         if (g_audio_ready && GetReferencePosition(tx, ty)) {
-            if (tx != 0 && ty != 0) {
-                LogWithTimestamp("[wzAudio_Watcher] A karakter sikeresen betöltött a világba! Indul a 3D motor.");
-                break;
-            }
+            if (tx != 0 && ty != 0) break;
         }
-        Sleep(200); // 200 ms-onként ellenőrizzük a betöltést
+        Sleep(200);
     }
 
     while (g_audio_ready)
     {
-        Sleep(16); // ~60 FPS frissítés
+        Sleep(16); // ~60 FPS
 
         short refX = 0, refY = 0;
         if (!GetReferencePosition(refX, refY)) continue;
-
-        // Biztonsági fék: Ha zónaváltás miatt ideiglenesen 0,0-ra ugrik a pozíció, kihagyjuk a kört!
         if (refX == 0 && refY == 0) continue;
 
         uintptr_t listPtr = *(uintptr_t*)OBJECT_LIST_BASE;
@@ -353,34 +346,101 @@ DWORD WINAPI AudioWatcherThread(LPVOID lpParam)
                 short mobX = *(short*)(entry + 0xAC);
                 short mobY = *(short*)(entry + 0xB0);
 
-                // HA A SZÖRNY INAKTÍV VAGY HALOTT (0,0), AKKOR ELNÉMÍTJUK ÉS KIHAGYJUK!
                 if (mobX == 0 && mobY == 0) {
                     g_VoicePool[i].pSourceVoice->SetVolume(0.0f);
                     continue;
                 }
 
-                // --- RADIKÁLIS HARDVERES SZTEREÓ TESZT JAVÍTÁSA ---
-                float manualMatrix[2] = { 0.0f, 0.0f };
+                // --- VALÓDI, GYÖNYÖRŰ 3D MATEMATIKAI PANNING ---
+                X3DAUDIO_LISTENER listener = {};
+                listener.Position.x = (float)refX * 0.1f; // Skálázás a széles panorámáért
+                listener.Position.y = 0.0f;
+                listener.Position.z = (float)refY * 0.1f;
+                listener.OrientFront.z = 1.0f;
+                listener.OrientTop.y = 1.0f;
 
-                if (mobX < refX)
-                {
-                    manualMatrix[0] = 1.0f; // Bal fül max
-                    manualMatrix[1] = 0.0f; // Jobb fül néma
-                }
-                else
-                {
-                    manualMatrix[0] = 0.0f; // Bal fül néma
-                    manualMatrix[1] = 1.0f; // Jobb fül max
-                }
+                X3DAUDIO_EMITTER emitter = {};
+                emitter.Position.x = (float)mobX * 0.1f;
+                emitter.Position.y = 0.0f;
+                emitter.Position.z = (float)mobY * 0.1f;
+                emitter.OrientFront.z = 1.0f;
+                emitter.OrientTop.y = 1.0f;
+                emitter.ChannelCount = 1; // Szigorúan 1 csatorna (ffmpeg mono!)
+                emitter.CurveDistanceScaler = 1.0f;
 
-                // Kikényszerítjük a tiszta sztereó mátrixot az érvényes szörnyre
-                g_VoicePool[i].pSourceVoice->SetOutputMatrix(g_master, 1, 2, manualMatrix);
-                g_VoicePool[i].pSourceVoice->SetVolume(1.0f); // Biztosítjuk, hogy hallható legyen
+                X3DAUDIO_DSP_SETTINGS dsp = {};
+                float matrixCoefficients[2] = { 0.0f, 0.0f };
+                dsp.SrcChannelCount = 1;
+                dsp.DstChannelCount = 2;
+                dsp.pMatrixCoefficients = matrixCoefficients;
+
+                X3DAudioCalculate(g_x3d, &listener, &emitter, X3DAUDIO_CALCULATE_MATRIX, &dsp);
+
+                // Ráírjuk a kiszámított sztereó képet az érvényes hangcsatornára
+                g_VoicePool[i].pSourceVoice->SetOutputMatrix(g_master, 1, 2, dsp.pMatrixCoefficients);
             }
         }
     }
     return 0;
 }
+
+//----------------------------------------------------------------------------
+//  VALÓS HANGEFFEKT FUZIÓK (Wav file + XAudio2)
+//----------------------------------------------------------------------------
+// Globális függvény: Fájlnév és Mob Index alapján indít 3D hangot az XAudio2-ben
+void Trigger3DEffectByFileName(const char* waveFileName, int mobIndex)
+{
+    if (!g_audio_ready || !waveFileName) return;
+
+    // Az asztalra kitett mono hangok elérése (vagy a játék Data\Sound mappája)
+    std::string fullPath = "Data\\Sound\\" + std::string(waveFileName);
+
+    WAVEFORMATEX wfx = { 0 };
+    std::vector<BYTE> audioData;
+
+    // Meghívjuk a korábbi WAV betöltőnket
+    if (!LoadWavFile(fullPath, audioData, wfx)) return;
+
+    std::lock_guard<std::mutex> lock(g_VoicePoolMutex);
+
+    int freeSlot = -1;
+    for (int i = 0; i < MAX_VOICE_POOL; i++) {
+        if (!g_VoicePool[i].bInUse) { freeSlot = i; break; }
+    }
+    if (freeSlot == -1) return;
+
+    wfx.nChannels = 1; // Kényszerített mono az ffmpeg alapján
+
+    IXAudio2SourceVoice* pSourceVoice = nullptr;
+    if (SUCCEEDED(g_xaudio->CreateSourceVoice(&pSourceVoice, &wfx))) {
+
+        XAUDIO2_VOICE_SENDS sendList = { 0 };
+        XAUDIO2_SEND_DESCRIPTOR sendDesc = { 0 };
+        sendDesc.pOutputVoice = g_master;
+        sendList.SendCount = 1;
+        sendList.pSends = &sendDesc;
+        pSourceVoice->SetOutputVoices(&sendList);
+
+        XAUDIO2_BUFFER buffer = { 0 };
+        buffer.AudioBytes = audioData.size();
+        buffer.pAudioData = audioData.data();
+        buffer.Flags = XAUDIO2_END_OF_STREAM;
+
+        if (SUCCEEDED(pSourceVoice->SubmitSourceBuffer(&buffer))) {
+            pSourceVoice->Start(0);
+            g_VoicePool[freeSlot].pSourceVoice = pSourceVoice;
+            g_VoicePool[freeSlot].targetMobIndex = mobIndex;
+            g_VoicePool[freeSlot].bInUse = true;
+        }
+        else {
+            pSourceVoice->DestroyVoice();
+        }
+    }
+}
+
+
+
+
 
     // ---------------------------------------------------------------------------
     //  EREDETI WZAUDIO 2.0 ZENEI FÜGGVÉNYEK
@@ -678,9 +738,6 @@ extern "C" __declspec(dllexport) int __cdecl wzAudioSetMixerMode(int mode) { ret
 extern "C" __declspec(dllexport) int __cdecl wzAudioVolumeDown() { return 1; }
 extern "C" __declspec(dllexport) int __cdecl wzAudioVolumeUp() { return 1; }
 
-// ---------------------------------------------------------------------------
-//  WZAUDIO ALAP EXPORT FÜGGVÉNYEK
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 //  VÉGLEGES WZAUDIOCREATE (A HÁTTÉRZENE VISSZAHOZÁSÁVAL)
