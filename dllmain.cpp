@@ -279,7 +279,7 @@ void PlayXAudio3DEffect(const BYTE* pWaveData, DWORD dataSize, WAVEFORMATEX* pWf
     if (freeSlot == -1) return;
 
     // Létrehozzuk a forrás hangcsatornát (az ffmpeg miatt ez fixen 1 csatornás MONO)
-    IXAudio2SourceVoice* pSourceVoice = nullptr;
+
     if (SUCCEEDED(g_xaudio->CreateSourceVoice(&pSourceVoice, pWfx))) {
         XAUDIO2_BUFFER buffer = { 0 };
         buffer.AudioBytes = dataSize;
@@ -300,61 +300,86 @@ void PlayXAudio3DEffect(const BYTE* pWaveData, DWORD dataSize, WAVEFORMATEX* pWf
 }
 
 // ---------------------------------------------------------------------------
-// FINOMHANGOLT VATCHER THREAD 
+//  VÉGLEGES, JAVÍTOTT WATCHER THREAD (v3.2.1)
 // ---------------------------------------------------------------------------
-DWORD WINAPI AudioWatcherThread(LPVOID lpParam) { // Bevárjuk a stabil betöltést (kihagyva a 0,0-ás kezdeti állapotot) 
-    while (true) {
+DWORD WINAPI AudioWatcherThread(LPVOID lpParam)
+{
+    // KŐKEMÉNY CIKLUS: Addig nem engedjük tovább a szálat, amíg a karakter be nem tölt (X és Y nem 0!)
+    while (true)
+    {
         short tx = 0, ty = 0;
         if (g_audio_ready && GetReferencePosition(tx, ty)) {
-            if (tx != 0 && ty != 0) break;
-        } Sleep(100);
-    }
-    while (g_audio_ready) {
-        Sleep(16); // ~60 FPS frissítés a sima hangátmenetekért 
-        short refX = 0, refY = 0;
-        if (!GetReferencePosition(refX, refY)) continue;
-        if (refX == 0 && refY == 0) continue; // Biztonsági fék térképváltáskor 
-        uintptr_t listPtr = *(uintptr_t*)OBJECT_LIST_BASE; if (!IsReadable((void*)listPtr, OBJECT_STRUCT_SIZE * 400)) continue;
-
-        // --- RADIKÁLIS HARDVERES SZTEREÓ TESZT (v3.1.8) --- 
-        // Nem használunk X3DAudio-t, hanem manuálisan írjuk a hangkártya csatornáit! 
-        std::lock_guard<std::mutex> lock(g_VoicePoolMutex);
-        for (int i = 0; i < MAX_VOICE_POOL; i++) {
-            if (!g_VoicePool[i].bInUse) continue;
-            XAUDIO2_VOICE_STATE state; g_VoicePool[i].pSourceVoice->GetState(&state);
-            if (state.SamplesPlayed == 0 && state.BuffersQueued == 0) {
-                g_VoicePool[i].pSourceVoice->DestroyVoice();
-                g_VoicePool[i].bInUse = false; continue;
-            } int mobIdx = g_VoicePool[i].targetMobIndex;
-            uintptr_t entry = listPtr + (mobIdx * OBJECT_STRUCT_SIZE);
-            if (IsReadable((void*)entry, OBJECT_STRUCT_SIZE)) {
-                short mobX = *(short*)(entry + 0xAC); short mobY = *(short*)(entry + 0xB0);
-                if (mobX == 0 && mobY == 0) continue; // Manuális hangerő mátrix létrehozása (Bal, Jobb) 
-                float manualMatrix[2] = { 0.0f, 0.0f };
-
-                // TESZT LOGIKA: Ha a szörny X koordinátája kisebb mint a miénk -> TISZTÁN BAL OLDAL 
-                // Ha nagyobb vagy egyenlő -> TISZTÁN JOBB OLDAL 
-                if (mobX < refX) {
-                    manualMatrix[0] = 1.0f; // Bal fül maximális hangerő 
-                    manualMatrix[1] = 0.0f; // Jobb fül teljes néma 
-                    char dbg[128];
-                    sprintf_s(dbg, "[3D_TEST] MobX (%d) < RefX (%d) -> KÉNYSZERÍTETT BAL OLDAL!", mobX, refX);
-                    LogWithTimestamp(dbg);
-                }
-                else {
-                    manualMatrix[0] = 0.0f; // Bal fül teljes néma 
-                    manualMatrix[1] = 1.0f; // Jobb fül maximális hangerő 
-                    char dbg[128];
-                    sprintf_s(dbg, "[3D_TEST] MobX (%d) >= RefX (%d) -> KÉNYSZERÍTETT JOBB OLDAL!", mobX, refX);
-                    LogWithTimestamp(dbg);
-                }
-                // Kikényszerítjük a nyers mátrixot az XAudio2-re 
-                // A harmadik paraméter (2) jelzi, hogy sztereó kimenetet célzunk meg 
-                g_VoicePool[i].pSourceVoice->SetOutputMatrix(g_master, 1, 2, manualMatrix);
+            if (tx != 0 && ty != 0) {
+                LogWithTimestamp("[wzAudio_Watcher] A karakter sikeresen betöltött a világba! Indul a 3D motor.");
+                break;
             }
         }
-        return 0;
+        Sleep(200); // 200 ms-onként ellenőrizzük a betöltést
     }
+
+    while (g_audio_ready)
+    {
+        Sleep(16); // ~60 FPS frissítés
+
+        short refX = 0, refY = 0;
+        if (!GetReferencePosition(refX, refY)) continue;
+
+        // Biztonsági fék: Ha zónaváltás miatt ideiglenesen 0,0-ra ugrik a pozíció, kihagyjuk a kört!
+        if (refX == 0 && refY == 0) continue;
+
+        uintptr_t listPtr = *(uintptr_t*)OBJECT_LIST_BASE;
+        if (!IsReadable((void*)listPtr, OBJECT_STRUCT_SIZE * 400)) continue;
+
+        std::lock_guard<std::mutex> lock(g_VoicePoolMutex);
+
+        for (int i = 0; i < MAX_VOICE_POOL; i++)
+        {
+            if (!g_VoicePool[i].bInUse) continue;
+
+            XAUDIO2_VOICE_STATE state;
+            g_VoicePool[i].pSourceVoice->GetState(&state);
+
+            if (state.SamplesPlayed == 0 && state.BuffersQueued == 0) {
+                g_VoicePool[i].pSourceVoice->DestroyVoice();
+                g_VoicePool[i].bInUse = false;
+                continue;
+            }
+
+            int mobIdx = g_VoicePool[i].targetMobIndex;
+            uintptr_t entry = listPtr + (mobIdx * OBJECT_STRUCT_SIZE);
+
+            if (IsReadable((void*)entry, OBJECT_STRUCT_SIZE))
+            {
+                short mobX = *(short*)(entry + 0xAC);
+                short mobY = *(short*)(entry + 0xB0);
+
+                // HA A SZÖRNY INAKTÍV VAGY HALOTT (0,0), AKKOR ELNÉMÍTJUK ÉS KIHAGYJUK!
+                if (mobX == 0 && mobY == 0) {
+                    g_VoicePool[i].pSourceVoice->SetVolume(0.0f);
+                    continue;
+                }
+
+                // --- RADIKÁLIS HARDVERES SZTEREÓ TESZT JAVÍTÁSA ---
+                float manualMatrix[2] = { 0.0f, 0.0f };
+
+                if (mobX < refX)
+                {
+                    manualMatrix[0] = 1.0f; // Bal fül max
+                    manualMatrix[1] = 0.0f; // Jobb fül néma
+                }
+                else
+                {
+                    manualMatrix[0] = 0.0f; // Bal fül néma
+                    manualMatrix[1] = 1.0f; // Jobb fül max
+                }
+
+                // Kikényszerítjük a tiszta sztereó mátrixot az érvényes szörnyre
+                g_VoicePool[i].pSourceVoice->SetOutputMatrix(g_master, 1, 2, manualMatrix);
+                g_VoicePool[i].pSourceVoice->SetVolume(1.0f); // Biztosítjuk, hogy hallható legyen
+            }
+        }
+    }
+    return 0;
 }
 
     // ---------------------------------------------------------------------------
@@ -435,6 +460,18 @@ DWORD WINAPI AudioWatcherThread(LPVOID lpParam) { // Bevárjuk a stabil betölt�
         virtual void __thiscall Option(int option, int value) = 0;
         virtual void __thiscall Destroy() = 0;
     };
+
+    class CWzAudioImpl : public IWzAudio {
+    public:
+        int __thiscall GetStreamOffsetRange(int unk1, int unk2) override { return 1; }
+        void __thiscall Play(const char* filePath, int volume, int unknown) override {}
+        void __thiscall Stop() override {}
+        void __thiscall SetVolume(int volume) override {}
+        void __thiscall Option(int option, int value) override {}
+        void __thiscall Destroy() override {}
+    };
+
+    CWzAudioImpl g_AudioInstance;
 
 #ifndef DS_OK
 #define DS_OK 0
@@ -645,21 +682,28 @@ extern "C" __declspec(dllexport) int __cdecl wzAudioVolumeUp() { return 1; }
 //  WZAUDIO ALAP EXPORT FÜGGVÉNYEK
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+//  VÉGLEGES WZAUDIOCREATE (A HÁTTÉRZENE VISSZAHOZÁSÁVAL)
+// ---------------------------------------------------------------------------
 extern "C" __declspec(dllexport) void* __cdecl wzAudioCreate() {
     mciSendStringA("close all", NULL, 0, NULL);
 
     if (!g_audio_ready) {
+        // Kiszedjük a CoInitializeEx-et, mert a main.exe-nek nem tetszett a szálmódosítás (ettől ment el a zene!)
         if (SUCCEEDED(XAudio2Create(&g_xaudio, 0, XAUDIO2_DEFAULT_PROCESSOR))) {
-            // A végén a hibás szűrő konstans helyett 0-t adunk át
-            if (SUCCEEDED(g_xaudio->CreateMasteringVoice(&g_master, 2, 44100, 0, NULL))) {
-                DWORD channelMask = 0;
-                g_master->GetChannelMask(&channelMask);
-                if (channelMask == 0) channelMask = SPEAKER_STEREO;
+
+            // Megtartjuk a kényszerített sztereó hardveres megnyitást, mert a log szerint ez tökéletesen működik!
+            if (SUCCEEDED(g_xaudio->CreateMasteringVoice(&g_master, 2, 44100, 0, NULL, NULL, AudioCategory_GameEffects))) {
 
                 XAUDIO2_VOICE_DETAILS details;
                 g_master->GetVoiceDetails(&details);
                 g_masterChannels = details.InputChannels;
 
+                char dbgMask[128];
+                sprintf_s(dbgMask, "[wzAudio_Init] Hardver csatornaszám sikeresen rögzítve: %d", g_masterChannels);
+                LogWithTimestamp(dbgMask);
+
+                DWORD channelMask = SPEAKER_STEREO;
                 X3DAudioInitialize(channelMask, X3DAUDIO_SPEED_OF_SOUND, g_x3d);
                 g_audio_ready = true;
             }
@@ -668,9 +712,11 @@ extern "C" __declspec(dllexport) void* __cdecl wzAudioCreate() {
 
     CreateMCIHelperWindow();
 
+    // Elindítjuk az új, intelligens Watcher Threadet
     CreateThread(NULL, 0, AudioWatcherThread, NULL, 0, NULL);
 
-
+    // SZIGORÚAN AZ EREDETI INSTANCE-AL TÉRÜNK VISSZA, HOGY A HÁTTÉRZENE AZONNAL MEGSZÓLALJON!
+    return &g_AudioInstance;
 }
 
 extern "C" __declspec(dllexport) int __cdecl wzAudioPlay(const char* filePath, int volume, int unknown) {
